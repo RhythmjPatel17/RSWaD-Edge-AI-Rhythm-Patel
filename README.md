@@ -28,32 +28,6 @@ This strategy ensures:
 
 ---
 
-## 🏗️ System Architecture
-
-
-Input Wafer Image
-│
-▼
-MobileNetV3 (Fast Inference)
-│
-▼
-Confidence Estimation
-│
-┌────┴────┐
-│         │
-High Conf Low Conf
-│           │
-▼           ▼
-Output MobileNetV2
-│
-▼
-Final Prediction
-
-
-The architecture dynamically adapts based on prediction confidence, enabling a balance between speed and accuracy.
-
----
-
 ## ⚙️ Methodology
 
 ### 🔹 Data Processing
@@ -83,7 +57,7 @@ The architecture dynamically adapts based on prediction confidence, enabling a b
 
 Confidence is calculated using **normalized entropy**, which measures prediction uncertainty:
 
-H(p) = -∑ p log(p)
+H(p) = -∑ p log(p) and 
 Confidence = 1 - (H(p) / log(N))
 
 
