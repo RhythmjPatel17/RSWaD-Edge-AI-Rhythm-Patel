@@ -1,98 +1,43 @@
 import numpy as np
 import cv2
 import json
+import time
 import sys
 import os
 import onnxruntime as ort
-import time
-import subprocess
 
 MODEL_V3 = "model_v3_fp16.onnx"
 MODEL_V2 = "model_v2_fp16.onnx"
 THRESHOLD = 0.75
 
 # -----------------------------
-# ⚡ POWER FUNCTION (JETSON)
-# -----------------------------
-def get_power():
-    try:
-        output = subprocess.check_output(
-            "tegrastats --interval 1000 --count 1",
-            shell=True
-        ).decode()
-
-        gpu_power = -1
-        cpu_power = -1
-
-        for token in output.split():
-            if "POM_5V_GPU" in token:
-                val = token.split("=")[1]
-                if "mW" in val:
-                    gpu_power = float(val.replace("mW", "")) / 1000.0
-
-            if "POM_5V_CPU" in token:
-                val = token.split("=")[1]
-                if "mW" in val:
-                    cpu_power = float(val.replace("mW", "")) / 1000.0
-
-        return cpu_power, gpu_power
-
-    except:
-        return -1, -1
-
-
-# -----------------------------
-# INPUT CHECK
-# -----------------------------
-if len(sys.argv) != 2:
-    print("Usage: python infer_image_j.py <image>")
-    exit()
-
-IMAGE_PATH = sys.argv[1]
-
-if not os.path.exists(IMAGE_PATH):
-    print("[ERROR] Image not found!")
-    exit()
-
-
-# -----------------------------
-# LOAD CLASSES
+# LOAD CLASS NAMES
 # -----------------------------
 with open("class_names.json", "r") as f:
     class_names = json.load(f)
 
-
 # -----------------------------
 # LOAD MODELS
 # -----------------------------
-available = ort.get_available_providers()
-
-providers = []
-if 'TensorrtExecutionProvider' in available:
-    providers.append('TensorrtExecutionProvider')
-if 'CUDAExecutionProvider' in available:
-    providers.append('CUDAExecutionProvider')
-providers.append('CPUExecutionProvider')
+providers = ort.get_available_providers()
 
 session_v3 = ort.InferenceSession(MODEL_V3, providers=providers)
 session_v2 = ort.InferenceSession(MODEL_V2, providers=providers)
 
 input_v3 = session_v3.get_inputs()[0].name
 output_v3 = session_v3.get_outputs()[0].name
+dtype_v3 = session_v3.get_inputs()[0].type
 
 input_v2 = session_v2.get_inputs()[0].name
 output_v2 = session_v2.get_outputs()[0].name
-
-dtype_v3 = session_v3.get_inputs()[0].type
 dtype_v2 = session_v2.get_inputs()[0].type
 
 
 # -----------------------------
 # PREPROCESS
 # -----------------------------
-def preprocess(img_path, dtype):
-    img = cv2.imread(img_path)
-    img = cv2.resize(img, (224, 224))
+def preprocess(frame, dtype):
+    img = cv2.resize(frame, (224, 224))
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     img = img.astype(np.float32) / 127.5 - 1.0
     img = np.expand_dims(img, axis=0)
@@ -111,75 +56,99 @@ def compute_confidence(probs):
 
 
 # -----------------------------
-# ⏱ START
+# CAMERA INIT
 # -----------------------------
-t_total_start = time.perf_counter()
+cap = cv2.VideoCapture(0)
 
-cpu_before, gpu_before = get_power()
+if not cap.isOpened():
+    print("[ERROR] Camera not detected")
+    exit()
 
-# ---- V3 INFERENCE ----
-t_v3_start = time.perf_counter()
-
-img_v3 = preprocess(IMAGE_PATH, dtype_v3)
-preds_v3 = infer(session_v3, input_v3, output_v3, img_v3)
-
-latency_v3 = time.perf_counter() - t_v3_start
-
-class_v3 = int(np.argmax(preds_v3))
-conf_v3 = compute_confidence(preds_v3)
-
-
-# ---- DECISION ----
-if conf_v3 >= THRESHOLD:
-    final_class = class_v3
-    confidence = conf_v3
-    used_model = "MobileNetV3 (Fast)"
-    latency_used = latency_v3
-else:
-    t_v2_start = time.perf_counter()
-
-    img_v2 = preprocess(IMAGE_PATH, dtype_v2)
-    preds_v2 = infer(session_v2, input_v2, output_v2, img_v2)
-
-    latency_v2 = time.perf_counter() - t_v2_start
-
-    final_class = int(np.argmax(preds_v2))
-    confidence = compute_confidence(preds_v2)
-    used_model = "MobileNetV2 (Accurate)"
-    latency_used = latency_v2
-
-
-prediction = class_names[final_class]
-
+print("✅ Camera started. Press ESC to exit.")
 
 # -----------------------------
-# POWER + LATENCY
+# MAIN LOOP
 # -----------------------------
-cpu_after, gpu_after = get_power()
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
 
-total_latency = time.perf_counter() - t_total_start
+    start_time = time.time()
 
-cpu_avg = (cpu_before + cpu_after) / 2 if cpu_before > 0 else 0
-gpu_avg = (gpu_before + gpu_after) / 2 if gpu_before > 0 else 0
+    # ---- V3 INFERENCE ----
+    img_v3 = preprocess(frame, dtype_v3)
+    preds_v3 = infer(session_v3, input_v3, output_v3, img_v3)
 
+    class_v3 = int(np.argmax(preds_v3))
+    conf_v3 = compute_confidence(preds_v3)
 
-# -----------------------------
-# OUTPUT
-# -----------------------------
-print("\n===== FINAL RESULT =====")
-print("Image:", IMAGE_PATH)
-print("Model Used:", used_model)
-print("Prediction:", prediction)
-print("Confidence:", f"{confidence*100:.2f}%")
+    # ---- MODEL DECISION ----
+    if conf_v3 >= THRESHOLD:
+        final_class = class_v3
+        confidence = conf_v3
+        used_model = "MobileNetV3 (Fast)"
+    else:
+        img_v2 = preprocess(frame, dtype_v2)
+        preds_v2 = infer(session_v2, input_v2, output_v2, img_v2)
 
-print("\n===== PERFORMANCE =====")
-print(f"V3 Latency: {latency_v3*1000:.2f} ms")
+        final_class = int(np.argmax(preds_v2))
+        confidence = compute_confidence(preds_v2)
+        used_model = "MobileNetV2 (Accurate)"
 
-if 'latency_v2' in locals():
-    print(f"V2 Latency: {latency_v2*1000:.2f} ms")
+    prediction = class_names[final_class]
 
-print(f"Used Model Latency: {latency_used*1000:.2f} ms")
-print(f"Total Latency: {total_latency*1000:.2f} ms")
+    # ---- METRICS ----
+    latency = (time.time() - start_time) * 1000
+    fps = 1 / (time.time() - start_time + 1e-6)
 
-print(f"CPU Power: {cpu_avg:.2f} W")
-print(f"GPU Power: {gpu_avg:.2f} W")
+    # -----------------------------
+    # DISPLAY OUTPUT
+    # -----------------------------
+    cv2.putText(frame,
+                f"Prediction: {prediction}",
+                (10, 50),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.9,
+                (0, 255, 0),
+                2)
+
+    cv2.putText(frame,
+                f"Confidence: {confidence*100:.2f}%",
+                (10, 90),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 255, 255),
+                2)
+
+    cv2.putText(frame,
+                f"Model: {used_model}",
+                (10, 130),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (255, 0, 0),
+                2)
+
+    cv2.putText(frame,
+                f"Latency: {latency:.2f} ms",
+                (10, 170),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2)
+
+    cv2.putText(frame,
+                f"FPS: {fps:.2f}",
+                (10, 210),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2)
+
+    cv2.imshow("RSWaD Edge AI - Real-Time Inference", frame)
+
+    if cv2.waitKey(1) & 0xFF == 27:
+        break
+
+cap.release()
+cv2.destroyAllWindows()
