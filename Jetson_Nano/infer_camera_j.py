@@ -1,39 +1,78 @@
 import numpy as np
 import cv2
 import json
-import time
 import sys
 import os
 import onnxruntime as ort
-import random
+import time
+import subprocess
 
 MODEL_V3 = "model_v3_fp16.onnx"
 MODEL_V2 = "model_v2_fp16.onnx"
+THRESHOLD = 0.75
 
-TEST_NAME = sys.argv[1].lower() if len(sys.argv) == 2 else None
+# -----------------------------
+# ⚡ POWER FUNCTION (JETSON)
+# -----------------------------
+def get_power():
+    try:
+        output = subprocess.check_output(
+            "tegrastats --interval 1000 --count 1",
+            shell=True
+        ).decode()
 
+        gpu_power = -1
+        cpu_power = -1
+
+        for token in output.split():
+            if "POM_5V_GPU" in token:
+                val = token.split("=")[1]
+                if "mW" in val:
+                    gpu_power = float(val.replace("mW", "")) / 1000.0
+
+            if "POM_5V_CPU" in token:
+                val = token.split("=")[1]
+                if "mW" in val:
+                    cpu_power = float(val.replace("mW", "")) / 1000.0
+
+        return cpu_power, gpu_power
+
+    except:
+        return -1, -1
+
+
+# -----------------------------
+# INPUT CHECK
+# -----------------------------
+if len(sys.argv) != 2:
+    print("Usage: python infer_image_j.py <image>")
+    exit()
+
+IMAGE_PATH = sys.argv[1]
+
+if not os.path.exists(IMAGE_PATH):
+    print("[ERROR] Image not found!")
+    exit()
+
+
+# -----------------------------
+# LOAD CLASSES
+# -----------------------------
 with open("class_names.json", "r") as f:
     class_names = json.load(f)
 
-mapping = {
-    "test.jpg": "scratch",
-    "test1.jpg": "donut",
-    "test2.jpg": "random",
-    "test3.jpg": "edge-loc",
-    "test4.jpg": "near-full",
-    "test5.jpg": "center",
-    "test6.jpg": "edgering",
-    "test7.jpg": "loc"
-}
 
-test_sequence = [
-    "test.jpg","test1.jpg","test2.jpg","test3.jpg",
-    "test4.jpg","test5.jpg","test6.jpg","test7.jpg"
-]
+# -----------------------------
+# LOAD MODELS
+# -----------------------------
+available = ort.get_available_providers()
 
-test_index = 0
-
-providers = ort.get_available_providers()
+providers = []
+if 'TensorrtExecutionProvider' in available:
+    providers.append('TensorrtExecutionProvider')
+if 'CUDAExecutionProvider' in available:
+    providers.append('CUDAExecutionProvider')
+providers.append('CPUExecutionProvider')
 
 session_v3 = ort.InferenceSession(MODEL_V3, providers=providers)
 session_v2 = ort.InferenceSession(MODEL_V2, providers=providers)
@@ -48,8 +87,12 @@ dtype_v3 = session_v3.get_inputs()[0].type
 dtype_v2 = session_v2.get_inputs()[0].type
 
 
-def preprocess(frame, dtype):
-    img = cv2.resize(frame, (224, 224))
+# -----------------------------
+# PREPROCESS
+# -----------------------------
+def preprocess(img_path, dtype):
+    img = cv2.imread(img_path)
+    img = cv2.resize(img, (224, 224))
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     img = img.astype(np.float32) / 127.5 - 1.0
     img = np.expand_dims(img, axis=0)
@@ -67,131 +110,76 @@ def compute_confidence(probs):
     return float(1 - entropy / np.log(len(probs)))
 
 
-cap = cv2.VideoCapture(0)
+# -----------------------------
+# ⏱ START
+# -----------------------------
+t_total_start = time.perf_counter()
 
-if not cap.isOpened():
-    print("[ERROR] Camera not detected")
-    exit()
+cpu_before, gpu_before = get_power()
 
-cycle_duration = 7
-cycle_start = time.time()
+# ---- V3 INFERENCE ----
+t_v3_start = time.perf_counter()
 
-last_prediction = "..."
-last_confidence = 0.0
-used_model = "..."
+img_v3 = preprocess(IMAGE_PATH, dtype_v3)
+preds_v3 = infer(session_v3, input_v3, output_v3, img_v3)
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
+latency_v3 = time.perf_counter() - t_v3_start
 
-    start_time = time.time()
+class_v3 = int(np.argmax(preds_v3))
+conf_v3 = compute_confidence(preds_v3)
 
-    now = time.time()
-    t = now - cycle_start
 
-    # ---------------- NEW CYCLE ----------------
-    if t > cycle_duration:
-        cycle_start = now
-        t = 0
+# ---- DECISION ----
+if conf_v3 >= THRESHOLD:
+    final_class = class_v3
+    confidence = conf_v3
+    used_model = "MobileNetV3 (Fast)"
+    latency_used = latency_v3
+else:
+    t_v2_start = time.perf_counter()
 
-        test_index = (test_index + 1) % len(test_sequence)
-        current_test = test_sequence[test_index]
+    img_v2 = preprocess(IMAGE_PATH, dtype_v2)
+    preds_v2 = infer(session_v2, input_v2, output_v2, img_v2)
 
-        # ---------------- INFERENCE ----------------
-        img_v3 = preprocess(frame, dtype_v3)
-        preds_v3 = infer(session_v3, input_v3, output_v3, img_v3)
+    latency_v2 = time.perf_counter() - t_v2_start
 
-        class_v3 = int(np.argmax(preds_v3))
-        conf_v3 = compute_confidence(preds_v3)
+    final_class = int(np.argmax(preds_v2))
+    confidence = compute_confidence(preds_v2)
+    used_model = "MobileNetV2 (Accurate)"
+    latency_used = latency_v2
 
-        if conf_v3 >= 0.75:
-            final_class = class_v3
-        else:
-            img_v2 = preprocess(frame, dtype_v2)
-            preds_v2 = infer(session_v2, input_v2, output_v2, img_v2)
-            final_class = int(np.argmax(preds_v2))
 
-        # ---------------- DYNAMIC CONFIDENCE ----------------
-        confidence = random.uniform(80, 98)
+prediction = class_names[final_class]
 
-        # ---------------- MODEL SWITCHING LOGIC ----------------
-        if confidence > 90:
-            used_model = "MobileNetV3 (Fast)"
-        else:
-            used_model = "MobileNetV2 (Accurate)"
 
-        last_prediction = class_names[final_class]
-        last_confidence = confidence
+# -----------------------------
+# POWER + LATENCY
+# -----------------------------
+cpu_after, gpu_after = get_power()
 
-        # OVERRIDE LOGIC (kept stable)
-        if current_test in mapping:
-            last_prediction = mapping[current_test]
+total_latency = time.perf_counter() - t_total_start
 
-    # ---------------- METRICS ----------------
-    fps = 1 / (time.time() - start_time + 1e-6)
-    latency = (time.time() - start_time) * 1000
+cpu_avg = (cpu_before + cpu_after) / 2 if cpu_before > 0 else 0
+gpu_avg = (gpu_before + gpu_after) / 2 if gpu_before > 0 else 0
 
-    # ---------------- PHASE 1 (0–2s) ----------------
-    if t < 2:
-        blink = int(time.time() * 4) % 2
-        cv2.putText(frame,
-                    "PROCESSING..." if blink else "",
-                    (10, 90),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1,
-                    (0, 0, 255),
-                    3)
 
-    # ---------------- PHASE 2 (2–4s) ----------------
-    elif t < 4:
-        cv2.putText(frame,
-                    f"Prediction: {last_prediction}",
-                    (10, 70),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.9,
-                    (0, 255, 0),
-                    2)
+# -----------------------------
+# OUTPUT
+# -----------------------------
+print("\n===== FINAL RESULT =====")
+print("Image:", IMAGE_PATH)
+print("Model Used:", used_model)
+print("Prediction:", prediction)
+print("Confidence:", f"{confidence*100:.2f}%")
 
-        cv2.putText(frame,
-                    f"Confidence: {last_confidence:.2f}%",
-                    (10, 120),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    (0, 255, 255),
-                    2)
+print("\n===== PERFORMANCE =====")
+print(f"V3 Latency: {latency_v3*1000:.2f} ms")
 
-    # ---------------- PHASE 3 (4–7s STABLE) ----------------
-    else:
-        cv2.putText(frame,
-                    f"{last_prediction}",
-                    (10, 70),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1,
-                    (255, 255, 0),
-                    2)
+if 'latency_v2' in locals():
+    print(f"V2 Latency: {latency_v2*1000:.2f} ms")
 
-        cv2.putText(frame,
-                    f"{last_confidence:.2f}%",
-                    (10, 120),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.9,
-                    (255, 255, 0),
-                    2)
+print(f"Used Model Latency: {latency_used*1000:.2f} ms")
+print(f"Total Latency: {total_latency*1000:.2f} ms")
 
-    # ---------------- SYSTEM INFO (ALWAYS) ----------------
-    cv2.putText(frame,
-                f"Model: {used_model}",
-                (10, 180),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (255, 0, 0),
-                2)
-
-    cv2.imshow("Adaptive RSWaD Edge AI Inference System", frame)
-
-    if cv2.waitKey(1) & 0xFF == 27:
-        break
-
-cap.release()
-cv2.destroyAllWindows()
+print(f"CPU Power: {cpu_avg:.2f} W")
+print(f"GPU Power: {gpu_avg:.2f} W")
